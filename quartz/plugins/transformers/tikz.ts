@@ -1,0 +1,109 @@
+import { Element, Properties } from "hast"
+import { fromHtmlIsomorphic } from "hast-util-from-html-isomorphic"
+import { toHtml } from "hast-util-to-html"
+import { h, s } from "hastscript"
+import { Code, Root as MdRoot } from "mdast"
+import { load, tex, dvi2svg } from "node-tikzjax"
+import { visit } from "unist-util-visit"
+import { svgOptions } from "../../components/svg"
+import { QuartzTransformerPlugin } from "../../types/plugin"
+
+async function tex2svg(input: string, showConsole: boolean) {
+  await load()
+  const dvi = await tex(input, {
+    texPackages: { pgfplots: "", amsmath: "intlimits" },
+    tikzLibraries: "arrows.meta,calc,positioning",
+    addToPreamble: "% comment",
+    showConsole,
+  })
+  const svg = await dvi2svg(dvi)
+  return svg
+}
+
+interface TikzNode {
+  index: number
+  value: string
+  parent: MdRoot
+  base64?: string
+}
+
+function parseStyle(meta: string | null | undefined): string {
+  if (!meta) return ""
+  const styleMatch = meta.match(/style\s*=\s*["']([^"']+)["']/)
+  return styleMatch ? styleMatch[1] : ""
+}
+
+const docs = (node: Code): string => JSON.stringify(node.value)
+
+// mainly for reparse from HTML back to MD
+function makeTikzGraph(node: Code, svg: string, style?: string): Element {
+  const properties: Properties = { 
+    "data-remark-tikz": true, 
+    style: style || "" 
+  }
+
+  return h(
+    "figure.tikz",
+    properties,
+    // This converts the raw SVG string into a HAST element tree
+    fromHtmlIsomorphic(svg, { fragment: true })
+  )
+}
+
+interface Options {
+  showConsole: boolean
+}
+
+const defaultOpts: Options = { showConsole: false }
+
+export const TikzJax: QuartzTransformerPlugin<Options> = (opts?: Options) => {
+  const o = { ...defaultOpts, ...opts }
+  return {
+    name: "TikzJax",
+    // TODO: maybe we should render client-side instead of server-side? (build-time would increase).
+    // We skip tikz transpilation for now during process (takes too long for a file with a lot of tikz graph)
+    markdownPlugins({ argv }) {
+      return [
+        () => async (tree) => {
+          const nodes: TikzNode[] = []
+          visit(tree, "code", (node: Code, index, parent) => {
+            let { lang, meta, value } = node
+            if (lang === "tikz") {
+              const base64Match = meta?.match(/alt\s*=\s*"data:image\/svg\+xml;base64,([^"]+)"/)
+              let base64String = undefined
+              if (base64Match) {
+                base64String = Buffer.from(base64Match[1], "base64").toString()
+              }
+              nodes.push({
+                index: index as number,
+                parent: parent as MdRoot,
+                value,
+                base64: base64String,
+              })
+            }
+          })
+
+          for (let i = 0; i < nodes.length; i++) {
+            const { index, parent, value, base64 } = nodes[i]
+            let svg
+            if (base64 !== undefined) svg = base64
+            else svg = await tex2svg(value, o.showConsole)
+            const node = parent.children[index] as Code
+
+            parent.children.splice(index, 1, {
+              type: "html",
+              value: toHtml(makeTikzGraph(node, svg, parseStyle(node?.meta)), {
+                allowDangerousHtml: true,
+              }),
+            })
+          }
+        },
+      ]
+    },
+    externalResources() {
+      return {
+        css: [{ content: "https://cdn.jsdelivr.net/npm/node-tikzjax@latest/css/fonts.css" }],
+      }
+    },
+  }
+}
